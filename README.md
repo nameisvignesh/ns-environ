@@ -26,10 +26,6 @@
 
 Environ is inspired by the familiar workbench pattern of VS Code. It is an independent implementation with its own UI, logo, and workspace services; it does not copy VS Code source or branding.
 
-<p align="center">
-  <img src="docs/screenshots/environ-desktop.png" alt="Environ desktop editor" width="900">
-</p>
-
 ## Features
 
 **Workbench**
