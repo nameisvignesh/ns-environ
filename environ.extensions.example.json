@@ -1,0 +1,12 @@
+{
+  "extensions": [
+    {
+      "id": "typescript-runner",
+      "name": "TypeScript runner",
+      "description": "Run the active TypeScript file with tsx.",
+      "program": "tsx",
+      "args": ["{file}"],
+      "file_extensions": ["ts", "tsx"]
+    }
+  ]
+}

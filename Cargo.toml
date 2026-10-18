@@ -1,6 +1,6 @@
 [package]
 name = "environ"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A focused, Rust-native desktop code editor."
 license = "MIT"
@@ -9,6 +9,8 @@ authors = ["Vignesh"]
 [dependencies]
 eframe = "0.33"
 rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 codegen-units = 1

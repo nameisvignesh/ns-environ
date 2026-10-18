@@ -3,12 +3,16 @@
 use eframe::egui::{self, Align, Color32, FontId, Key, Layout, RichText, TextEdit};
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use rfd::FileDialog;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -17,7 +21,45 @@ const PANEL_BG: Color32 = Color32::from_rgb(21, 23, 29);
 const BORDER: Color32 = Color32::from_rgb(39, 42, 51);
 const TEXT: Color32 = Color32::from_rgb(230, 231, 236);
 const MUTED: Color32 = Color32::from_rgb(130, 135, 148);
-const ACCENT: Color32 = Color32::from_rgb(145, 198, 174);
+const ACCENT: Color32 = Color32::from_rgb(117, 142, 255);
+const ACTIVE: Color32 = Color32::from_rgb(47, 50, 77);
+const TERMINAL_BG: Color32 = Color32::from_rgb(15, 17, 21);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidebarView {
+    Explorer,
+    Search,
+    Extensions,
+}
+
+#[derive(Clone, Debug)]
+struct ExtensionRunner {
+    id: String,
+    name: String,
+    description: String,
+    program: String,
+    args: Vec<String>,
+    file_extensions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ExtensionManifest {
+    #[serde(default)]
+    extensions: Vec<ManifestExtension>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestExtension {
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    file_extensions: Vec<String>,
+}
 
 #[derive(Clone, Debug)]
 struct WorkspaceEntry {
@@ -56,6 +98,15 @@ struct EnvironApp {
     active_tab: Option<usize>,
     command_palette_open: bool,
     command_query: String,
+    sidebar_view: SidebarView,
+    sidebar_visible: bool,
+    terminal_visible: bool,
+    search_query: String,
+    extension_runners: Vec<ExtensionRunner>,
+    terminal_input: String,
+    terminal_lines: Vec<String>,
+    terminal_receiver: Option<Receiver<String>>,
+    terminal_running: bool,
     find_open: bool,
     find_query: String,
     replace_query: String,
@@ -81,6 +132,17 @@ impl EnvironApp {
             active_tab: None,
             command_palette_open: false,
             command_query: String::new(),
+            sidebar_view: SidebarView::Explorer,
+            sidebar_visible: true,
+            terminal_visible: true,
+            search_query: String::new(),
+            extension_runners: builtin_extensions(),
+            terminal_input: String::new(),
+            terminal_lines: vec![
+                "Environ terminal — commands run inside the open workspace.".to_owned(),
+            ],
+            terminal_receiver: None,
+            terminal_running: false,
             find_open: false,
             find_query: String::new(),
             replace_query: String::new(),
@@ -120,8 +182,16 @@ impl EnvironApp {
         self.expanded.insert(root);
         self.tabs.clear();
         self.active_tab = None;
+        self.extension_runners = load_extensions(self.workspace.as_deref());
+        self.terminal_lines =
+            vec!["Environ terminal — commands run inside the open workspace.".to_owned()];
+        self.terminal_running = false;
+        self.terminal_receiver = None;
         self.error = None;
-        self.notice = "Workspace ready".to_owned();
+        self.notice = format!(
+            "Workspace ready · {} runner(s) available",
+            self.extension_runners.len()
+        );
         Ok(())
     }
 
@@ -287,9 +357,18 @@ impl EnvironApp {
             if command && input.modifiers.shift && input.key_pressed(Key::S) {
                 self.save_all();
             }
-            if command && input.modifiers.shift && input.key_pressed(Key::P) {
+            if command
+                && (input.key_pressed(Key::P)
+                    || (input.modifiers.shift && input.key_pressed(Key::P)))
+            {
                 self.command_palette_open = true;
                 self.command_query.clear();
+            }
+            if command && input.key_pressed(Key::B) {
+                self.sidebar_visible = !self.sidebar_visible;
+            }
+            if command && input.key_pressed(Key::Backtick) {
+                self.terminal_visible = !self.terminal_visible;
             }
             if command && input.key_pressed(Key::F) {
                 self.find_open = true;
@@ -302,6 +381,131 @@ impl EnvironApp {
         });
     }
 
+    fn poll_terminal(&mut self) {
+        let mut completed = false;
+        if let Some(receiver) = &self.terminal_receiver {
+            while let Ok(line) = receiver.try_recv() {
+                completed = line.starts_with("[completed") || line.starts_with("[failed");
+                self.terminal_lines.push(line);
+            }
+        }
+        if completed {
+            self.terminal_running = false;
+            self.terminal_receiver = None;
+        }
+    }
+
+    fn active_relative_file(&self) -> Option<PathBuf> {
+        let root = self.workspace.as_ref()?;
+        let tab = self.tabs.get(self.active_tab?)?;
+        tab.path.strip_prefix(root).ok().map(Path::to_path_buf)
+    }
+
+    fn runner_available_for_active_file(&self, runner: &ExtensionRunner) -> bool {
+        if runner.file_extensions.is_empty() {
+            return true;
+        }
+        self.active_relative_file()
+            .and_then(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_owned)
+            })
+            .is_some_and(|extension| {
+                runner
+                    .file_extensions
+                    .iter()
+                    .any(|expected| expected.eq_ignore_ascii_case(&extension))
+            })
+    }
+
+    fn run_extension(&mut self, id: &str) {
+        let Some(runner) = self
+            .extension_runners
+            .iter()
+            .find(|runner| runner.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        if !self.runner_available_for_active_file(&runner) {
+            self.show_error(format!(
+                "{} needs an active {} file.",
+                runner.name,
+                runner.file_extensions.join(" or .")
+            ));
+            return;
+        }
+        let file = self.active_relative_file();
+        if !runner.file_extensions.is_empty() && file.is_none() {
+            self.show_error("Open a file before running this extension.".to_owned());
+            return;
+        }
+        let args = expand_runner_args(&runner.args, file.as_deref());
+        self.run_process(&runner.name, runner.program, args);
+    }
+
+    fn run_terminal_input(&mut self) {
+        let command = self.terminal_input.trim().to_owned();
+        if command.is_empty() || self.terminal_running {
+            return;
+        }
+        self.terminal_input.clear();
+        #[cfg(windows)]
+        self.run_process("Terminal", "cmd".to_owned(), vec!["/C".to_owned(), command]);
+        #[cfg(not(windows))]
+        self.run_process("Terminal", "sh".to_owned(), vec!["-lc".to_owned(), command]);
+    }
+
+    fn run_process(&mut self, label: &str, program: String, args: Vec<String>) {
+        if self.terminal_running {
+            self.notice = "A terminal command is already running".to_owned();
+            return;
+        }
+        let Ok(root) = self.workspace_root() else {
+            self.show_error("Open a workspace before running a command.".to_owned());
+            return;
+        };
+        let display = std::iter::once(program.clone())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.terminal_lines.push(format!("ns > {display}"));
+        self.terminal_visible = true;
+        self.terminal_running = true;
+        self.notice = format!("Running {label}");
+        let (sender, receiver) = mpsc::channel();
+        let label = label.to_owned();
+        thread::spawn(move || {
+            let result = Command::new(&program)
+                .args(&args)
+                .current_dir(root)
+                .output();
+            match result {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                    if !stdout.is_empty() {
+                        let _ = sender.send(stdout);
+                    }
+                    if !stderr.is_empty() {
+                        let _ = sender.send(stderr);
+                    }
+                    let status = if output.status.success() {
+                        "completed"
+                    } else {
+                        "failed"
+                    };
+                    let _ = sender.send(format!("[{status}: {label} ({})]", output.status));
+                }
+                Err(error) => {
+                    let _ = sender.send(format!("[failed: could not start {label}: {error}]"));
+                }
+            }
+        });
+        self.terminal_receiver = Some(receiver);
+    }
+
     fn draw_top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar")
             .frame(
@@ -312,10 +516,9 @@ impl EnvironApp {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    draw_logo(ui, 25.0);
-                    ui.label(RichText::new("Environ").strong().color(TEXT));
-                    ui.separator();
+                    ui.add_space(7.0);
+                    draw_logo(ui, 27.0);
+                    ui.label(RichText::new("NS Environ").strong().color(TEXT));
                     ui.label(
                         RichText::new(
                             self.workspace
@@ -327,29 +530,94 @@ impl EnvironApp {
                         .small()
                         .color(MUTED),
                     );
+                    ui.add_space(64.0);
+                    if ui
+                        .add_sized(
+                            [390.0, 29.0],
+                            egui::Button::new(
+                                RichText::new(
+                                    "⌕   Search files and commands                       Ctrl/⌘ P",
+                                )
+                                .small()
+                                .color(MUTED),
+                            )
+                            .fill(TERMINAL_BG)
+                            .stroke(egui::Stroke::new(1.0_f32, BORDER)),
+                        )
+                        .clicked()
+                    {
+                        self.command_palette_open = true;
+                        self.command_query.clear();
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Save").clicked() {
-                            self.save_active();
-                        }
                         if ui.button("Open folder").clicked() {
                             self.open_workspace();
                         }
-                        if ui
-                            .button("⌘⇧P")
-                            .on_hover_text("Open command palette")
-                            .clicked()
-                        {
-                            self.command_palette_open = true;
-                            self.command_query.clear();
-                        }
+                        ui.label(RichText::new("◧   ▱   ◐").color(MUTED));
                     });
                 });
                 ui.add_space(4.0);
             });
     }
 
-    fn draw_explorer(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("explorer")
+    fn draw_activity_bar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("activity_bar")
+            .exact_width(44.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(TERMINAL_BG)
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.add_space(5.0);
+                for (view, icon, label) in [
+                    (SidebarView::Explorer, "▤", "Explorer"),
+                    (SidebarView::Search, "⌕", "Search workspace"),
+                    (SidebarView::Extensions, "▦", "Extensions"),
+                ] {
+                    let active = self.sidebar_visible && self.sidebar_view == view;
+                    let button =
+                        egui::Button::new(RichText::new(icon).size(21.0).color(if active {
+                            TEXT
+                        } else {
+                            MUTED
+                        }))
+                        .fill(if active { ACTIVE } else { Color32::TRANSPARENT })
+                        .frame(false);
+                    if ui
+                        .add_sized([34.0, 37.0], button)
+                        .on_hover_text(label)
+                        .clicked()
+                    {
+                        if active {
+                            self.sidebar_visible = false;
+                        } else {
+                            self.sidebar_visible = true;
+                            self.sidebar_view = view;
+                        }
+                    }
+                }
+                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                    if ui
+                        .add_sized(
+                            [34.0, 34.0],
+                            egui::Button::new(RichText::new("⚙").color(MUTED)).frame(false),
+                        )
+                        .on_hover_text("Manage")
+                        .clicked()
+                    {
+                        self.about_open = true;
+                    }
+                });
+            });
+    }
+
+    fn draw_sidebar(&mut self, ctx: &egui::Context) {
+        if !self.sidebar_visible {
+            return;
+        }
+        egui::SidePanel::left("sidebar")
             .default_width(270.0)
             .resizable(true)
             .frame(
@@ -357,35 +625,119 @@ impl EnvironApp {
                     .fill(PANEL_BG)
                     .stroke(egui::Stroke::new(1.0_f32, BORDER)),
             )
-            .show(ctx, |ui| {
+            .show(ctx, |ui| match self.sidebar_view {
+                SidebarView::Explorer => self.draw_explorer_contents(ui),
+                SidebarView::Search => self.draw_search_contents(ui),
+                SidebarView::Extensions => self.draw_extension_contents(ui),
+            });
+    }
+
+    fn draw_explorer_contents(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("EXPLORER").small().strong().color(MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("+").on_hover_text("Open folder").clicked() {
+                    self.open_workspace();
+                }
+            });
+        });
+        ui.separator();
+
+        let Some(root) = self.workspace.clone() else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(120.0);
+                draw_logo(ui, 48.0);
+                ui.add_space(8.0);
+                ui.label(RichText::new("Your project files").color(MUTED));
+                ui.label(RichText::new("will appear here.").color(MUTED));
+                if ui.button("Open a folder").clicked() {
+                    self.open_workspace();
+                }
+            });
+            return;
+        };
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            self.draw_tree(ui, &root, 0);
+        });
+    }
+
+    fn draw_search_contents(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("SEARCH").small().strong().color(MUTED));
+        ui.add_space(5.0);
+        ui.add(TextEdit::singleline(&mut self.search_query).hint_text("Search open files"));
+        ui.separator();
+        let query = self.search_query.to_lowercase();
+        let matches: Vec<(usize, String)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                let name = tab.name();
+                (query.is_empty()
+                    || name.to_lowercase().contains(&query)
+                    || tab.content.to_lowercase().contains(&query))
+                .then_some((index, name))
+            })
+            .collect();
+        if matches.is_empty() {
+            ui.label(
+                RichText::new("Open files are searchable here.")
+                    .small()
+                    .color(MUTED),
+            );
+        }
+        for (index, name) in matches {
+            if ui
+                .selectable_label(self.active_tab == Some(index), format!("◇  {name}"))
+                .clicked()
+            {
+                self.active_tab = Some(index);
+            }
+        }
+    }
+
+    fn draw_extension_contents(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("EXTENSIONS").small().strong().color(MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .small_button("↻")
+                    .on_hover_text("Reload environ.extensions.json")
+                    .clicked()
+                {
+                    self.extension_runners = load_extensions(self.workspace.as_deref());
+                    self.notice = format!("Loaded {} runner(s)", self.extension_runners.len());
+                }
+            });
+        });
+        ui.separator();
+        ui.label(RichText::new("Runnable extensions").small().color(MUTED));
+        ui.add_space(4.0);
+        let runners = self.extension_runners.clone();
+        for runner in runners {
+            ui.group(|ui| {
+                ui.label(RichText::new(&runner.name).strong().color(TEXT));
+                ui.label(RichText::new(&runner.description).small().color(MUTED));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("EXPLORER").small().strong().color(MUTED));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("+").on_hover_text("Open folder").clicked() {
-                            self.open_workspace();
-                        }
-                    });
-                });
-                ui.separator();
-
-                let Some(root) = self.workspace.clone() else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(120.0);
-                        draw_logo(ui, 48.0);
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Your project files").color(MUTED));
-                        ui.label(RichText::new("will appear here.").color(MUTED));
-                        if ui.button("Open a folder").clicked() {
-                            self.open_workspace();
-                        }
-                    });
-                    return;
-                };
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.draw_tree(ui, &root, 0);
+                    let enabled =
+                        !self.terminal_running && self.runner_available_for_active_file(&runner);
+                    if ui.add_enabled(enabled, egui::Button::new("Run")).clicked() {
+                        self.run_extension(&runner.id);
+                    }
+                    if !runner.file_extensions.is_empty() {
+                        ui.label(
+                            RichText::new(format!(".{}", runner.file_extensions.join(", .")))
+                                .small()
+                                .color(MUTED),
+                        );
+                    }
                 });
             });
+            ui.add_space(4.0);
+        }
+        ui.separator();
+        ui.label(RichText::new("Add project runners in environ.extensions.json. Each runner is shown here and only runs when you click Run.").small().color(MUTED));
     }
 
     fn draw_tree(&mut self, ui: &mut egui::Ui, directory: &Path, depth: usize) {
@@ -437,9 +789,21 @@ impl EnvironApp {
                         if tab.dirty() {
                             label.push_str(" •");
                         }
-                        let response = ui.selectable_label(
-                            active,
-                            RichText::new(label).color(if active { TEXT } else { MUTED }),
+                        let response = ui.add(
+                            egui::Button::new(RichText::new(label).color(if active {
+                                TEXT
+                            } else {
+                                MUTED
+                            }))
+                            .fill(if active {
+                                PANEL_BG
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::new(
+                                if active { 1.0_f32 } else { 0.0_f32 },
+                                if active { ACCENT } else { Color32::TRANSPARENT },
+                            )),
                         );
                         if response.clicked() {
                             self.active_tab = Some(index);
@@ -451,6 +815,19 @@ impl EnvironApp {
                     }
                 });
                 ui.separator();
+
+                if let Some(index) = self.active_tab
+                    && let Some(tab) = self.tabs.get(index)
+                    && let Some(root) = &self.workspace
+                {
+                    let path = tab.path.strip_prefix(root).unwrap_or(&tab.path);
+                    ui.label(
+                        RichText::new(format!("{}", path.display()))
+                            .small()
+                            .color(MUTED),
+                    );
+                    ui.separator();
+                }
 
                 if self.find_open {
                     ui.horizontal(|ui| {
@@ -490,24 +867,23 @@ impl EnvironApp {
             draw_logo(ui, 76.0);
             ui.add_space(18.0);
             ui.label(
-                RichText::new("A calmer place to build")
+                RichText::new("A quiet place to write code")
                     .small()
                     .color(ACCENT),
             );
             ui.add_space(8.0);
-            ui.heading(
-                RichText::new("Make room for good work.")
-                    .color(TEXT)
-                    .size(27.0),
+            ui.heading(RichText::new("NS Environ").color(TEXT).size(27.0));
+            ui.label(
+                RichText::new("A VS Code-style workspace, built independently in Rust.")
+                    .color(MUTED),
             );
-            ui.label(RichText::new("Open a project to start exploring your code.").color(MUTED));
             ui.add_space(18.0);
             if ui.button("Open project folder  ↗").clicked() {
                 self.open_workspace();
             }
             ui.add_space(10.0);
             ui.label(
-                RichText::new("⌘O to open  ·  ⌘S to save  ·  ⌘⇧P for commands")
+                RichText::new("Ctrl/⌘ P command search  ·  Ctrl/⌘ B sidebar  ·  Ctrl/⌘ ` terminal")
                     .small()
                     .color(MUTED),
             );
@@ -516,14 +892,14 @@ impl EnvironApp {
 
     fn draw_status_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status_bar")
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(28, 41, 36)))
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(32, 43, 92)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("⌁").color(ACCENT));
+                    ui.label(RichText::new("ns  ›").strong().color(TEXT));
                     ui.label(
                         RichText::new(self.notice.clone())
                             .small()
-                            .color(Color32::from_rgb(192, 210, 199)),
+                            .color(Color32::from_rgb(211, 219, 255)),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(error) = &self.error {
@@ -532,30 +908,89 @@ impl EnvironApp {
                                     .small()
                                     .color(Color32::from_rgb(237, 155, 145)),
                             );
-                        } else if let Some(index) = self.active_tab
-                            && let Some(tab) = self.tabs.get(index)
-                        {
-                            ui.label(
-                                RichText::new(if tab.dirty() {
-                                    "Unsaved changes"
-                                } else {
-                                    "Saved"
-                                })
-                                .small()
-                                .color(Color32::from_rgb(192, 210, 199)),
-                            );
-                            ui.label(
-                                RichText::new(format!("{} chars", tab.content.chars().count()))
-                                    .small()
-                                    .color(MUTED),
-                            );
                         }
                         ui.label(
-                            RichText::new("Environ 0.2")
+                            RichText::new("UTF-8")
                                 .small()
-                                .color(Color32::from_rgb(154, 175, 162)),
+                                .color(Color32::from_rgb(211, 219, 255)),
+                        );
+                        ui.label(
+                            RichText::new("Spaces: 2")
+                                .small()
+                                .color(Color32::from_rgb(211, 219, 255)),
+                        );
+                        ui.label(
+                            RichText::new("0 problems")
+                                .small()
+                                .color(Color32::from_rgb(211, 219, 255)),
                         );
                     });
+                });
+            });
+    }
+
+    fn draw_terminal(&mut self, ctx: &egui::Context) {
+        if !self.terminal_visible {
+            return;
+        }
+        egui::TopBottomPanel::bottom("terminal")
+            .default_height(210.0)
+            .min_height(120.0)
+            .resizable(true)
+            .frame(
+                egui::Frame::NONE
+                    .fill(TERMINAL_BG)
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("TERMINAL").small().strong().color(TEXT));
+                    ui.label(
+                        RichText::new(if self.terminal_running {
+                            "Running…"
+                        } else {
+                            "Problems 0"
+                        })
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Hide terminal (Ctrl/⌘ `)")
+                            .clicked()
+                        {
+                            self.terminal_visible = false;
+                        }
+                        if ui.small_button("Clear").clicked() && !self.terminal_running {
+                            self.terminal_lines.clear();
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.terminal_lines {
+                            ui.label(
+                                RichText::new(line)
+                                    .font(FontId::monospace(12.0))
+                                    .color(TEXT),
+                            );
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("ns ›").monospace().color(ACCENT));
+                    let response = ui.add_enabled(
+                        !self.terminal_running,
+                        TextEdit::singleline(&mut self.terminal_input)
+                            .font(FontId::monospace(13.0))
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Type a command and press Enter"),
+                    );
+                    if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                        self.run_terminal_input();
+                    }
                 });
             });
     }
@@ -578,6 +1013,12 @@ impl EnvironApp {
                     ("Save file", "Save the active editor tab"),
                     ("Save all files", "Save every dirty tab"),
                     ("Find in file", "Open find and replace"),
+                    ("Toggle sidebar", "Show or hide the workspace sidebar"),
+                    ("Toggle terminal", "Show or hide the integrated terminal"),
+                    ("Show extensions", "Open runnable extensions"),
+                    ("Run Rust workspace", "Run cargo run in this workspace"),
+                    ("Run active Python file", "Run the active .py file"),
+                    ("Run active Node file", "Run the active JavaScript file"),
                     ("About Environ", "View version and project information"),
                 ];
                 for (name, description) in commands {
@@ -593,6 +1034,15 @@ impl EnvironApp {
                             "Save file" => self.save_active(),
                             "Save all files" => self.save_all(),
                             "Find in file" => self.find_open = true,
+                            "Toggle sidebar" => self.sidebar_visible = !self.sidebar_visible,
+                            "Toggle terminal" => self.terminal_visible = !self.terminal_visible,
+                            "Show extensions" => {
+                                self.sidebar_visible = true;
+                                self.sidebar_view = SidebarView::Extensions;
+                            }
+                            "Run Rust workspace" => self.run_extension("rust-workspace"),
+                            "Run active Python file" => self.run_extension("python-file"),
+                            "Run active Node file" => self.run_extension("node-file"),
                             "About Environ" => self.about_open = true,
                             _ => {}
                         }
@@ -678,10 +1128,13 @@ impl EnvironApp {
 
 impl App for EnvironApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        self.poll_terminal();
         self.handle_shortcuts(ctx);
         self.draw_top_bar(ctx);
-        self.draw_explorer(ctx);
+        self.draw_activity_bar(ctx);
+        self.draw_sidebar(ctx);
         self.draw_status_bar(ctx);
+        self.draw_terminal(ctx);
         self.draw_editor(ctx);
         self.draw_command_palette(ctx);
         self.draw_close_confirmation(ctx);
@@ -689,10 +1142,78 @@ impl App for EnvironApp {
         if self
             .saved_at
             .is_some_and(|saved| saved.elapsed().as_secs() < 2)
+            || self.terminal_running
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
+}
+
+fn builtin_extensions() -> Vec<ExtensionRunner> {
+    vec![
+        ExtensionRunner {
+            id: "rust-workspace".to_owned(),
+            name: "Rust workspace runner".to_owned(),
+            description: "Runs cargo run at the workspace root.".to_owned(),
+            program: "cargo".to_owned(),
+            args: vec!["run".to_owned()],
+            file_extensions: Vec::new(),
+        },
+        ExtensionRunner {
+            id: "python-file".to_owned(),
+            name: "Python runner".to_owned(),
+            description: "Runs the active Python source file.".to_owned(),
+            program: "python".to_owned(),
+            args: vec!["{file}".to_owned()],
+            file_extensions: vec!["py".to_owned()],
+        },
+        ExtensionRunner {
+            id: "node-file".to_owned(),
+            name: "Node.js runner".to_owned(),
+            description: "Runs the active JavaScript file with Node.js.".to_owned(),
+            program: "node".to_owned(),
+            args: vec!["{file}".to_owned()],
+            file_extensions: vec!["js".to_owned(), "mjs".to_owned(), "cjs".to_owned()],
+        },
+    ]
+}
+
+fn load_extensions(workspace: Option<&Path>) -> Vec<ExtensionRunner> {
+    let mut runners = builtin_extensions();
+    let Some(root) = workspace else {
+        return runners;
+    };
+    let manifest_path = root.join("environ.extensions.json");
+    let Ok(contents) = fs::read_to_string(manifest_path) else {
+        return runners;
+    };
+    let Ok(manifest) = serde_json::from_str::<ExtensionManifest>(&contents) else {
+        return runners;
+    };
+    runners.extend(manifest.extensions.into_iter().filter_map(|extension| {
+        let valid_id = !extension.id.trim().is_empty();
+        let valid_program = !extension.program.trim().is_empty()
+            && !Path::new(&extension.program).is_absolute()
+            && !extension.program.contains(['/', '\\']);
+        (valid_id && valid_program).then_some(ExtensionRunner {
+            id: extension.id,
+            name: extension.name,
+            description: extension.description,
+            program: extension.program,
+            args: extension.args,
+            file_extensions: extension.file_extensions,
+        })
+    }));
+    runners
+}
+
+fn expand_runner_args(args: &[String], file: Option<&Path>) -> Vec<String> {
+    let file = file
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    args.iter()
+        .map(|argument| argument.replace("{file}", &file))
+        .collect()
 }
 
 fn draw_logo(ui: &mut egui::Ui, size: f32) {
@@ -702,9 +1223,9 @@ fn draw_logo(ui: &mut egui::Ui, size: f32) {
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        "e",
+        "NS",
         FontId::proportional(size * 0.68),
-        Color32::from_rgb(16, 25, 21),
+        Color32::from_rgb(14, 16, 20),
     );
 }
 
@@ -933,8 +1454,8 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_within, fingerprint};
-    use std::path::Path;
+    use super::{ensure_within, expand_runner_args, fingerprint};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn fingerprints_change_when_file_bytes_change() {
@@ -948,5 +1469,14 @@ mod tests {
         assert!(ensure_within(root, root).is_ok());
         assert!(ensure_within(root, Path::new("C:/workspace/src/main.rs")).is_ok());
         assert!(ensure_within(root, Path::new("C:/other/main.rs")).is_err());
+    }
+
+    #[test]
+    fn runner_arguments_expand_the_active_workspace_file() {
+        let file = PathBuf::from("src/main.py");
+        assert_eq!(
+            expand_runner_args(&["{file}".to_owned(), "--watch".to_owned()], Some(&file)),
+            vec!["src/main.py", "--watch"]
+        );
     }
 }
