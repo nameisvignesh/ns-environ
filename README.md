@@ -1,6 +1,6 @@
 <div align="center">
 
-<secrion>
+<secrion align="middle">
       <a href="https://github.com/OWNER/environ">
         <picture>
           <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/ns-environ-logo.png">
