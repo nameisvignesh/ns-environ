@@ -1,20 +1,14 @@
 <div align="center">
 
-<table>
-  <tr>
-    <td valign="middle">
+<secrion>
       <a href="https://github.com/OWNER/environ">
         <picture>
           <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/ns-environ-logo.png">
           <img alt="Environ logo" src="docs/brand/ns-environ-logo.png" width="120">
         </picture>
       </a>
-    </td>
-    <td valign="middle">
       <h1>Environ</h1>
-    </td>
-  </tr>
-</table>
+</secrion>
 
 **A focused, Rust-native desktop code editor with a familiar workbench.**
 
