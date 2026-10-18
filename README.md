@@ -5,7 +5,7 @@
     <td valign="middle">
       <a href="https://github.com/OWNER/environ">
         <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="docs/brand/ns-environ-logo-dark.png">
+          <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/ns-environ-logo.png">
           <img alt="Environ logo" src="docs/brand/ns-environ-logo.png" width="120">
         </picture>
       </a>
